@@ -16,14 +16,19 @@ def fetch_html(url, timeout=10):
         return None
 
 def parse_homepage(url, html, allowed_prefix=None):
-    soup = BeautifulSoup(html, 'html.parser')
+    soup  = BeautifulSoup(html, 'html.parser')
     links = set()
-    for a in soup.find_all('a'):
-        href = a.get('href')
-        if href:
-            full_url = urljoin(url, href)
-            if allowed_prefix is None or full_url.startswith(allowed_prefix):
-                links.add(full_url)
+
+    for a in soup.find_all('a', href=True):
+        if a.find_parent('footer'):
+            continue
+
+        full_url = urljoin(url, a['href'])
+        if allowed_prefix and not full_url.startswith(allowed_prefix):
+            continue
+
+        links.add(full_url)
+
     return list(links)
 
 
