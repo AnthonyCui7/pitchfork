@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import json
+import re
 from datetime import datetime
 import argparse
 
@@ -16,37 +17,52 @@ def fetch_html(url, timeout=10):
         return None
 
 def parse_homepage(url, html, allowed_prefix=None):
-    soup  = BeautifulSoup(html, 'html.parser')
+    """Return all article‐style links matching allowed_prefix, skipping footer links."""
+    soup = BeautifulSoup(html, 'html.parser')
     links = set()
 
     for a in soup.find_all('a', href=True):
         if a.find_parent('footer'):
             continue
-
         full_url = urljoin(url, a['href'])
         if allowed_prefix and not full_url.startswith(allowed_prefix):
             continue
-
         links.add(full_url)
 
     return list(links)
-
 
 def extract_article(url, html):
     """Extract metadata and cleaned text from an article page."""
     soup = BeautifulSoup(html, 'html.parser')
 
-    # Metadata extraction
     title_tag = soup.find('h1', class_='article__title') or soup.find('h1')
     title = title_tag.get_text(strip=True) if title_tag else ''
 
-    author_tag = soup.find('a', rel='author') or soup.select_one('span.river-byline__authors')
-    author = author_tag.get_text(strip=True) if author_tag else ''
+    # New, multi-step author extraction:
+    author = ''
+    # 1) meta tag
+    m = soup.find('meta', attrs={'name': 'author'})
+    if m and m.get('content'):
+        author = m['content'].strip()
+    else:
+        # 2) any <a rel="author">
+        a = soup.find('a', rel='author')
+        if a and a.get_text(strip=True):
+            author = a.get_text(strip=True)
+        else:
+            # 3) inside .river-byline__authors container
+            link = soup.select_one('.river-byline__authors a')
+            if link and link.get_text(strip=True):
+                author = link.get_text(strip=True)
+            else:
+                # 4) fallback: look for "By X Y"
+                byline = soup.find(text=re.compile(r'^\s*By\s+'))
+                if byline:
+                    author = byline.strip().lstrip('By ').strip()
 
     date_tag = soup.find('time')
     published = date_tag.get('datetime') if date_tag and date_tag.get('datetime') else ''
 
-    # Robust body extraction with multiple selectors
     selectors = [
         'div.article-content',
         'div.article__content',
@@ -72,11 +88,15 @@ def extract_article(url, html):
     paragraphs = []
     if article_body:
         for p in article_body.find_all('p'):
-            text = p.get_text(strip=True)
+            text = p.get_text(separator=' ', strip=True)
             if text:
                 paragraphs.append(text)
 
-    clean_text = "\n\n".join(paragraphs)
+    clean_text = " ".join(paragraphs)
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    clean_text = re.sub(r'\s+([.,!?:;])', r'\1', clean_text)
+    clean_text = re.sub(r'\(\s+', '(', clean_text)
+    clean_text = re.sub(r'\s+\)', ')', clean_text)
 
     return {
         'title':      title,
@@ -85,78 +105,65 @@ def extract_article(url, html):
         'clean_text': clean_text
     }
 
-def run_scraper(homepage_url, output_path):
+def run_scraper(categories, output_path):
+    domain = "techcrunch.com"
+    allowed_prefix = f"https://{domain}/20"
     scraped_urls = set()
-    page = 1
     record_counter = 1
 
-    domain = urlparse(homepage_url).netloc
-    allowed_prefix = f"https://{domain}/20"
-
     with open(output_path, 'w', encoding='utf-8') as out_f:
-        while True:
-            if page == 1:
-                page_url = homepage_url
-            else:
-                page_url = urljoin(homepage_url.rstrip('/') + '/', f'page/{page}/')
+        for category in categories:
+            homepage_url = f"https://{domain}/category/{category}/"
+            for page in range(1, 334):  # pages 1–333
+                if page == 1:
+                    page_url = homepage_url
+                else:
+                    page_url = urljoin(homepage_url.rstrip('/') + '/', f'page/{page}/')
 
-            if page == 3:
-                break
-
-            print(f"Fetching page {page}: {page_url}")
-            homepage_html = fetch_html(page_url)
-            if not homepage_html:
-                print(f"No HTML fetched for {page_url}, stopping.")
-                break
-
-            article_urls = parse_homepage(page_url, homepage_html, allowed_prefix=allowed_prefix)
-            new_urls = [u for u in article_urls if u not in scraped_urls]
-
-            if not new_urls:
-                print(f"No new date‐style articles found on page {page}, stopping.")
-                break
-
-            print(f"  → Found {len(new_urls)} new articles on page {page}.")
-
-            for article_url in new_urls:
-                html = fetch_html(article_url)
+                print(f"Fetching page {page}: {page_url}")
+                html = fetch_html(page_url)
                 if not html:
-                    continue
+                    print(f"No HTML fetched for {page_url}, stopping {category}.")
+                    break
 
-                meta = extract_article(article_url, html)
-                record = {
-                    'id':         f"tc-{datetime.now().strftime('%Y%m%d')}-{record_counter:03d}",
-                    'source':     domain,
-                    'url':        article_url,
-                    'scraped_at': datetime.now().astimezone().isoformat(),
-                    'title':      meta['title'],
-                    'author':     meta['author'],
-                    'published':  meta['published'],
-                    'raw_html':   html,
-                    'clean_text': meta['clean_text'].replace("\n", "")
-                }
-                out_f.write(json.dumps(record, ensure_ascii=False) + '\n')
-                scraped_urls.add(article_url)
-                record_counter += 1
+                article_urls = parse_homepage(page_url, html, allowed_prefix=allowed_prefix)
+                new_urls = [u for u in article_urls if u not in scraped_urls]
 
-            page += 1
+                if not new_urls:
+                    print(f"No new date‐style articles found on page {page}, stopping {category}.")
+                    break
 
-    print(f"Scraping complete. Total articles: {len(scraped_urls)}. Output written to {output_path}.")
+                print(f"  → Found {len(new_urls)} new articles on page {page} of the {category} category.")
 
-    print(meta['clean_text'].replace("\n", ""))
+                for article_url in new_urls:
+                    art_html = fetch_html(article_url)
+                    if not art_html:
+                        continue
+                    meta = extract_article(article_url, art_html)
+                    record = {
+                        'id':         f"tc-{datetime.now().strftime('%Y%m%d')}-{record_counter:03d}",
+                        'source':     domain,
+                        'url':        article_url,
+                        'title':      meta['title'],
+                        'author':     meta['author'],
+                        'published':  meta['published'],
+                        'scraped_at': datetime.now().astimezone().isoformat(),
+                        'clean_text': meta['clean_text']
+                    }
+                    out_f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                    scraped_urls.add(article_url)
+                    record_counter += 1
 
+    print(f"Scraping complete. Total unique articles: {len(scraped_urls)}. Output written to {output_path}.")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='TechCrunch startups scraper')
-    parser.add_argument(
-        '--url',
-        default='https://techcrunch.com/category/startups/',
-        help='Category URL (e.g., TechCrunch startups)'
-    )
+    parser = argparse.ArgumentParser(description='TechCrunch startups & venture scraper')
     parser.add_argument(
         '-o', '--output',
         default='prototype_output.jsonl',
         help='Path to output JSONL file'
     )
     args = parser.parse_args()
-    run_scraper(args.url, args.output)
+
+    categories = ['startups', 'venture']
+    run_scraper(categories, args.output)
